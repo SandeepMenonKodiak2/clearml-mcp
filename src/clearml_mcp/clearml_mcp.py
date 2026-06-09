@@ -1,5 +1,6 @@
 """ClearML MCP Server implementation."""
 
+import re
 from typing import Any
 
 from clearml import Model, Task
@@ -40,26 +41,30 @@ async def get_task_info(task_id: str) -> dict[str, Any]:
 
 _TASK_LIST_FIELDS = ["name", "status", "tags", "created", "project"]
 
-_PROJECT_NAME_CACHE: dict[str, str] = {}
+_PROJECT_NAME_CACHE: dict[str, str] | None = None
 
 
 def _to_str(v: Any) -> Any:
     if v is None:
         return None
+    if hasattr(v, "value"):
+        return str(v.value)
     return v if isinstance(v, str) else str(v)
 
 
 def _project_name(project_id: str | None) -> str | None:
+    global _PROJECT_NAME_CACHE
     if not project_id:
         return None
-    if not _PROJECT_NAME_CACHE:
+    if _PROJECT_NAME_CACHE is None:
+        _PROJECT_NAME_CACHE = {}  # sentinel set before loading so failures aren't retried
         try:
             for p in Task.get_projects():
                 pid = getattr(p, "id", None)
                 if pid:
                     _PROJECT_NAME_CACHE[pid] = p.name
         except Exception:
-            return project_id
+            pass
     return _PROJECT_NAME_CACHE.get(project_id, project_id)
 
 
@@ -276,7 +281,7 @@ async def find_experiment_in_project(
     try:
         rows = Task.query_tasks(
             project_name=project_name,
-            task_name=f"(?i){experiment_pattern}",
+            task_name=f"(?i){re.escape(experiment_pattern)}",
             additional_return_fields=_TASK_LIST_FIELDS,
             task_filter={"order_by": ["-last_update"]},
         )
@@ -380,7 +385,7 @@ async def search_tasks(query: str, project_name: str | None = None) -> list[dict
             additional_return_fields=_TASK_LIST_FIELDS + ["comment"],
             task_filter={
                 "order_by": ["-last_update"],
-                "_any_": {"fields": ["name", "comment"], "pattern": f"(?i){query}"},
+                "_any_": {"fields": ["name", "comment"], "pattern": f"(?i){re.escape(query)}"},
             },
         )
 
