@@ -38,41 +38,61 @@ async def get_task_info(task_id: str) -> dict[str, Any]:
         return {"error": f"Failed to get task info: {e!s}"}
 
 
+_TASK_LIST_FIELDS = ["name", "status", "tags", "created", "project"]
+
+_PROJECT_NAME_CACHE: dict[str, str] = {}
+
+
+def _to_str(v: Any) -> Any:
+    if v is None:
+        return None
+    return v if isinstance(v, str) else str(v)
+
+
+def _project_name(project_id: str | None) -> str | None:
+    if not project_id:
+        return None
+    if not _PROJECT_NAME_CACHE:
+        try:
+            for p in Task.get_projects():
+                pid = getattr(p, "id", None)
+                if pid:
+                    _PROJECT_NAME_CACHE[pid] = p.name
+        except Exception:
+            return project_id
+    return _PROJECT_NAME_CACHE.get(project_id, project_id)
+
+
+def _task_dict(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "name": row.get("name"),
+        "status": _to_str(row.get("status")),
+        "project": _project_name(row.get("project")),
+        "created": _to_str(row.get("created")),
+        "tags": list(row.get("tags") or []),
+    }
+
+
 @mcp.tool()
 async def list_tasks(
     project_name: str | None = None,
     status: str | None = None,
     tags: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """List ClearML tasks with filters."""
+    """List ClearML tasks with filters. Returns ordered by most recent update."""
     try:
-        # Task.query_tasks returns task IDs (strings), not task objects
-        task_ids = Task.query_tasks(
+        task_filter: dict[str, Any] = {"order_by": ["-last_update"]}
+        if status:
+            task_filter["status"] = [status]
+
+        rows = Task.query_tasks(
             project_name=project_name,
-            task_filter={"status": [status]} if status else None,
             tags=tags,
+            additional_return_fields=_TASK_LIST_FIELDS,
+            task_filter=task_filter,
         )
-
-        # Convert task IDs to full task objects
-        tasks = []
-        for task_id in task_ids:
-            try:
-                task = Task.get_task(task_id=task_id)
-                tasks.append(
-                    {
-                        "id": task.id,
-                        "name": task.name,
-                        "status": task.status,
-                        "project": task.get_project_name(),
-                        "created": str(task.data.created),
-                        "tags": list(task.data.tags) if task.data.tags else [],
-                    }
-                )
-            except Exception as e:
-                # If we can't get a specific task, include the error but continue
-                tasks.append({"id": task_id, "error": f"Failed to get task details: {e!s}"})
-
-        return tasks
+        return [_task_dict(r) for r in rows]
     except Exception as e:
         return [{"error": f"Failed to list tasks: {e!s}"}]
 
@@ -252,32 +272,15 @@ async def find_project_by_pattern(pattern: str) -> list[dict[str, Any]]:
 async def find_experiment_in_project(
     project_name: str, experiment_pattern: str
 ) -> list[dict[str, Any]]:
-    """Find experiments in a specific project by name pattern."""
+    """Find experiments in a project by name pattern (case-insensitive regex, server-side)."""
     try:
-        # Get task IDs for the project
-        task_ids = Task.query_tasks(project_name=project_name)
-
-        matching_experiments = []
-        pattern_lower = experiment_pattern.lower()
-
-        for task_id in task_ids:
-            try:
-                task = Task.get_task(task_id=task_id)
-                if pattern_lower in task.name.lower():
-                    matching_experiments.append(
-                        {
-                            "id": task.id,
-                            "name": task.name,
-                            "status": task.status,
-                            "project": task.get_project_name(),
-                            "created": str(task.data.created),
-                        }
-                    )
-            except Exception:
-                # Skip tasks we can't access - could be permissions or API issues
-                pass
-
-        return matching_experiments
+        rows = Task.query_tasks(
+            project_name=project_name,
+            task_name=f"(?i){experiment_pattern}",
+            additional_return_fields=_TASK_LIST_FIELDS,
+            task_filter={"order_by": ["-last_update"]},
+        )
+        return [_task_dict(r) for r in rows]
     except Exception as e:
         return [{"error": f"Failed to find experiments: {e!s}"}]
 
@@ -300,20 +303,27 @@ async def list_projects() -> list[dict[str, Any]]:
 
 @mcp.tool()
 async def get_project_stats(project_name: str) -> dict[str, Any]:
-    """Get project statistics and task counts."""
+    """Get project statistics and task counts (single bulk query, full project)."""
     try:
-        tasks = Task.query_tasks(project_name=project_name)
+        rows = Task.query_tasks(
+            project_name=project_name,
+            additional_return_fields=["status", "type"],
+        )
 
-        status_counts = {}
-        for task in tasks:
-            status = task.status
+        status_counts: dict[str, int] = {}
+        task_types: set[str] = set()
+        for r in rows:
+            status = _to_str(r.get("status")) or "unknown"
             status_counts[status] = status_counts.get(status, 0) + 1
+            t_type = r.get("type")
+            if t_type:
+                task_types.add(_to_str(t_type))
 
         return {
             "project_name": project_name,
-            "total_tasks": len(tasks),
+            "total_tasks": len(rows),
             "status_breakdown": status_counts,
-            "task_types": list(set(task.type for task in tasks if hasattr(task, "type"))),
+            "task_types": sorted(task_types),
         }
     except Exception as e:
         return {"error": f"Failed to get project stats: {e!s}"}
@@ -362,46 +372,41 @@ async def compare_tasks(task_ids: list[str], metrics: list[str] | None = None) -
 
 @mcp.tool()
 async def search_tasks(query: str, project_name: str | None = None) -> list[dict[str, Any]]:
-    """Search tasks by name, tags, or description."""
+    """Search tasks by name, tag, or comment (server-side regex on name+comment)."""
     try:
-        # Task.query_tasks returns task IDs (strings), not task objects
-        task_ids = Task.query_tasks(project_name=project_name)
+        # Match query in name or comment server-side via _any_ regex filter.
+        rows = Task.query_tasks(
+            project_name=project_name,
+            additional_return_fields=_TASK_LIST_FIELDS + ["comment"],
+            task_filter={
+                "order_by": ["-last_update"],
+                "_any_": {"fields": ["name", "comment"], "pattern": f"(?i){query}"},
+            },
+        )
 
-        matching_tasks = []
-        query_lower = query.lower()
+        # Also fetch exact-tag matches in one extra bulk call (cheap).
+        tag_rows: list[dict[str, Any]] = []
+        try:
+            tag_rows = Task.query_tasks(
+                project_name=project_name,
+                tags=[query],
+                additional_return_fields=_TASK_LIST_FIELDS + ["comment"],
+                task_filter={"order_by": ["-last_update"]},
+            )
+        except Exception:
+            pass
 
-        for task_id in task_ids:
-            try:
-                task = Task.get_task(task_id=task_id)
-
-                # Check if the task matches the search query
-                task_name = task.name.lower()
-                task_comment = getattr(task, "comment", "") or ""
-                task_tags = list(task.data.tags) if task.data.tags else []
-
-                if (
-                    query_lower in task_name
-                    or (task_comment and query_lower in task_comment.lower())
-                    or any(query_lower in tag.lower() for tag in task_tags)
-                ):
-                    matching_tasks.append(
-                        {
-                            "id": task.id,
-                            "name": task.name,
-                            "status": task.status,
-                            "project": task.get_project_name(),
-                            "created": str(task.data.created),
-                            "tags": task_tags,
-                            "comment": task_comment,
-                        }
-                    )
-            except Exception as e:
-                # If we can't get a specific task, skip it but log the error
-                matching_tasks.append(
-                    {"id": task_id, "error": f"Failed to get task details: {e!s}"}
-                )
-
-        return matching_tasks
+        seen: set[str] = set()
+        out: list[dict[str, Any]] = []
+        for r in list(rows) + list(tag_rows):
+            rid = r.get("id")
+            if not rid or rid in seen:
+                continue
+            seen.add(rid)
+            d = _task_dict(r)
+            d["comment"] = r.get("comment") or ""
+            out.append(d)
+        return out
     except Exception as e:
         return [{"error": f"Failed to search tasks: {e!s}"}]
 
