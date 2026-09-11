@@ -175,6 +175,8 @@ The ClearML MCP server provides **19 comprehensive tools** for ML experiment ana
 - `list_tasks` - List tasks with advanced filtering (project, status, tags, user)
 - `get_task_parameters` - Retrieve hyperparameters and configuration
 - `get_task_metrics` - Access training metrics, scalars, and plots
+- `list_plot_metrics` - List a task's plot metric/variant names, without payload
+- `get_task_plots` - Get PR curves, histograms and confusion matrices (filterable, spillable to disk)
 - `get_task_artifacts` - Get artifacts, model files, and outputs
 - `download_artifact` - Download one artifact to local disk (archives are extracted)
 - `get_task_script` - Get the repo/branch/commit a task ran from, plus its uncommitted diff
